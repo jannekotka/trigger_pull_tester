@@ -1,0 +1,39 @@
+# ESP-IDF
+build/
+dependencies.lock
+sdkconfig
+sdkconfig.old
+*.bin
+*.elf
+*.map
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+venv_clean/
+env/
+ENV/
+*.egg-info/
+dist/
+*.egg
+
+
+# IDE
+.vscode/
+.idea/
+.pio
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
