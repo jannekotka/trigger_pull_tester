@@ -245,59 +245,65 @@ class LoadCellPlotter(QMainWindow):
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
 
-        # Control panel
-        control_layout = QHBoxLayout()
+        # Control panel - Connection row
+        connection_layout = QHBoxLayout()
 
         # Port selection
         self.port_label = QLabel("Serial Port:")
-        control_layout.addWidget(self.port_label)
+        connection_layout.addWidget(self.port_label)
 
         self.port_combo = QComboBox()
         self.refresh_ports()
-        control_layout.addWidget(self.port_combo)
+        connection_layout.addWidget(self.port_combo)
 
         # Refresh ports button
         self.refresh_btn = QPushButton("Refresh Ports")
         self.refresh_btn.clicked.connect(self.refresh_ports)
-        control_layout.addWidget(self.refresh_btn)
+        connection_layout.addWidget(self.refresh_btn)
 
         # Connect/Disconnect button
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.clicked.connect(self.toggle_connection)
-        control_layout.addWidget(self.connect_btn)
+        connection_layout.addWidget(self.connect_btn)
+
+        connection_layout.addStretch()
+        layout.addLayout(connection_layout)
+
+        # Status and data row
+        status_layout = QHBoxLayout()
 
         # Status label
         self.status_label = QLabel("Status: Disconnected")
-        control_layout.addWidget(self.status_label)
+        status_layout.addWidget(self.status_label)
 
         # Position label
         self.position_label = QLabel("Position: 0.000 mm")
-        control_layout.addWidget(self.position_label)
+        status_layout.addWidget(self.position_label)
 
         # Stats labels
         self.min_label = QLabel("Min: ---")
-        control_layout.addWidget(self.min_label)
+        status_layout.addWidget(self.min_label)
 
         self.max_label = QLabel("Max: ---")
-        control_layout.addWidget(self.max_label)
+        status_layout.addWidget(self.max_label)
 
         self.current_label = QLabel("Current: ---")
-        control_layout.addWidget(self.current_label)
+        status_layout.addWidget(self.current_label)
 
-        control_layout.addStretch()
+        status_layout.addStretch()
 
         # Calibrate button
         self.calibrate_btn = QPushButton("Calibrate")
         self.calibrate_btn.clicked.connect(self.open_calibration_dialog)
         self.calibrate_btn.setEnabled(False)
-        control_layout.addWidget(self.calibrate_btn)
+        status_layout.addWidget(self.calibrate_btn)
 
         # Clear button
         self.clear_btn = QPushButton("Clear")
         self.clear_btn.clicked.connect(self.clear_data)
-        control_layout.addWidget(self.clear_btn)
+        status_layout.addWidget(self.clear_btn)
 
-        layout.addLayout(control_layout)
+        layout.addLayout(status_layout)
 
         # Motor control panel
         motor_layout = QHBoxLayout()
@@ -592,8 +598,8 @@ class LoadCellPlotter(QMainWindow):
             self.send_command("MEASURE_START")
             import time
             time.sleep(0.1)  # Small delay between commands
-            print(f"Sending MOVE {distance} 1000")  # Debug - 1000us (1ms) per step for measurement
-            self.send_command(f"MOVE {distance} 1000")
+            print(f"Sending MOVE {distance} 2000")
+            self.send_command(f"MOVE {distance} 2000")
 
         except ValueError as e:
             print(f"ValueError: {e}")  # Debug
