@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -22,13 +23,19 @@
 // Step pulse timing (microseconds)
 #define STEP_PULSE_WIDTH_US 5   // Pulse width (10us for reliability)
 #define STEP_DELAY_MIN_US   400 // Slower speed for 1/8 microstepping (500 Hz)
-#define ACCEL_STEPS         50   // Number of steps to accelerate/decelerate
+#define ACCEL_STEPS         500   // Number of steps to accelerate/decelerate
 
 // Motor and lead screw configuration
 #define STEPS_PER_REV       200   // 1.8° motor = 200 steps/rev
-#define MICROSTEPS          8     // Microstepping setting
+#define MICROSTEPS          32     // Microstepping setting
 #define LEAD_SCREW_PITCH_MM 2.0   // 2mm lead screw
 #define STEPS_PER_MM        ((STEPS_PER_REV * MICROSTEPS) / LEAD_SCREW_PITCH_MM)  // 800 steps/mm
+
+// Phase accumulator timer configuration
+#define TICK_HZ        20000       // fixed timer tick rate (20 kHz)
+#define DITHER_HZ      20          // dither frequency
+#define LUT_SIZE       256
+#define Q              16          // Q16.16 fixed-point
 
 // Motor state for non-blocking movement
 static volatile int32_t target_position_steps = 0;
@@ -36,38 +43,84 @@ static volatile int32_t current_position_steps = 0;
 static volatile bool motor_moving = false;
 static volatile bool motor_direction = 0; // 0 = backward, 1 = forward
 static volatile bool measuring_active = false; // Only output load cell data when measuring
-static volatile uint32_t current_speed_ms = 1; // Current timer period in ms (1ms = 1000 steps/sec)
+
+// Base speed in steps/sec (set from control task)
+static volatile uint32_t base_sps = 1000;          // steps per second
+static volatile uint16_t dither_eps_permille = 100; // 100 = 10% speed dither
+
+// Internal ISR state for phase accumulator
+static uint32_t phase_q = 0; // Q16.16 where 1.0 == (1<<Q)
+static uint32_t sin_phase_q = 0; // Q16.16 over [0, LUT_SIZE)
+static uint32_t sin_inc_q = 0;   // Q16.16 increment per tick
+
+// Sine LUT in Q1.15 (-32768..32767)
+static int16_t sin_lut[LUT_SIZE];
+
 static gptimer_handle_t step_timer = NULL;
 
 // Forward declarations
 void move_distance_mm(float distance_mm, bool direction);
 void stepper_init(void);
 
-// Hardware timer ISR callback for motor stepping
+// Initialize sine LUT (call once at init)
+static void init_sin_lut(void)
+{
+    for (int i = 0; i < LUT_SIZE; i++) {
+        float a = (2.0f * 3.14159265f * i) / LUT_SIZE;
+        sin_lut[i] = (int16_t)(32767.0f * sinf(a));
+    }
+
+    // sin_inc_q = LUT_SIZE * DITHER_HZ / TICK_HZ in Q16.16
+    sin_inc_q = (uint32_t)((((uint64_t)LUT_SIZE * DITHER_HZ) << 16) / TICK_HZ);
+}
+
+static inline void IRAM_ATTR pulse_step_pin(void)
+{
+    gpio_set_level(STEP_PIN, 1);
+}
+
+// Hardware timer ISR callback for motor stepping with phase accumulator
 static bool IRAM_ATTR step_timer_callback(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx)
 {
     if (!motor_moving) return false;
-
+    gpio_set_level(STEP_PIN, 0);
+    // Stop condition
     if (current_position_steps == target_position_steps) {
         motor_moving = false;
         gpio_set_level(EN_PIN, 1);  // Disable motor when done
         return false;
     }
 
-    // Perform one step - keep it minimal in ISR
-    gpio_set_level(STEP_PIN, 1);
-    // Minimal delay for pulse width
-    for (volatile int i = 0; i < 5; i++);
-    gpio_set_level(STEP_PIN, 0);
+    // Compute dithered step rate per tick in Q16.16:
+    // step_rate_per_tick = (steps/sec) / TICK_HZ
+    // dither: base * (1 + eps * sin)
+    uint32_t sps = base_sps;
 
-    // Update position
-    if (motor_direction) {
-        current_position_steps++;
-    } else {
-        current_position_steps--;
+    sin_phase_q += sin_inc_q;
+    uint16_t idx = (sin_phase_q >> 16) & (LUT_SIZE - 1);
+    int16_t s = sin_lut[idx];  // Q1.15
+
+    // Apply epsilon in permille (0..1000). Convert sin Q1.15 to a signed multiplier.
+    // delta_sps = sps * eps * sin
+    // scale: eps_permille/1000 * s/32768
+    int32_t delta = (int32_t)(( (int64_t)sps * dither_eps_permille * s ) / (1000LL * 32768LL));
+    int32_t sps_dithered = (int32_t)sps + delta;
+    if (sps_dithered < 1) sps_dithered = 1;
+
+    uint32_t rate_q = (uint32_t)(((uint64_t)sps_dithered << Q) / TICK_HZ);
+
+    // Phase accumulator decides when to step
+    phase_q += rate_q;
+    if (phase_q >= (1u << Q)) {
+        phase_q -= (1u << Q);
+
+        pulse_step_pin();
+
+        if (motor_direction) current_position_steps++;
+        else                 current_position_steps--;
     }
 
-    return false;  // Don't yield from ISR
+    return false;
 }
 
 // HX711 Functions
@@ -109,52 +162,27 @@ bool hx711_is_ready(void)
     return gpio_get_level(HX711_DT_PIN) == 0;
 }
 
-int32_t hx711_read_raw(void)
+
+
+int32_t hx711_read_raw_no_wait(void)
 {
-    // Check initial DT state
-    int dt_before = gpio_get_level(HX711_DT_PIN);
-
-    // Wait for HX711 to be ready (DT goes low)
-    uint32_t timeout = 1000000;
-    while(!hx711_is_ready() && timeout--) {
-        esp_rom_delay_us(1);
-    }
-
-    if(timeout == 0) {
-        ESP_LOGW(TAG, "HX711 timeout - DT stuck at %d", dt_before);
-        return -1;
-    }
-
-    ESP_LOGI(TAG, "HX711 ready, starting read...");
-
+    // Assumes DT is already low (HX711 is ready)
     // Read 24 bits
     uint32_t data = 0;
-    uint8_t bits_high = 0;
-    int first_bit = -1;
-    int last_bit = -1;
     for(int i = 0; i < 24; i++) {
         gpio_set_level(HX711_SCK_PIN, 1);
-        esp_rom_delay_us(10);  // Longer delay for 10Hz mode
+        esp_rom_delay_us(1);
         int bit = gpio_get_level(HX711_DT_PIN);
-        if(i == 0) first_bit = bit;
-        if(i == 23) last_bit = bit;
-        if(bit) bits_high++;
         data = (data << 1) | bit;
         gpio_set_level(HX711_SCK_PIN, 0);
-        esp_rom_delay_us(10);  // Longer delay for 10Hz mode
-    }
-
-    ESP_LOGI(TAG, "Read: %d/24 bits HIGH, first=%d, last=%d, data=0x%06lX",
-             bits_high, first_bit, last_bit, data);
-
-    // Try Channel B instead (3 extra clock pulses for gain 32)
-    // This is in case the load cell is wired to B instead of A
-    for(int i = 0; i < 3; i++) {
-        gpio_set_level(HX711_SCK_PIN, 1);
-        esp_rom_delay_us(1);
-        gpio_set_level(HX711_SCK_PIN, 0);
         esp_rom_delay_us(1);
     }
+
+    // 1 extra clock pulse for Channel A gain 128 (next read)
+    gpio_set_level(HX711_SCK_PIN, 1);
+    esp_rom_delay_us(1);
+    gpio_set_level(HX711_SCK_PIN, 0);
+    esp_rom_delay_us(1);
 
     // Convert to signed 24-bit
     if(data & 0x800000) {
@@ -164,15 +192,6 @@ int32_t hx711_read_raw(void)
     return (int32_t)data;
 }
 
-float hx711_read_average(uint8_t samples)
-{
-    int64_t sum = 0;
-    for(uint8_t i = 0; i < samples; i++) {
-        sum += hx711_read_raw();
-        vTaskDelay(1 / portTICK_PERIOD_MS);
-    }
-    return (float)sum / samples;
-}
 
 void stepper_init(void)
 {
@@ -193,17 +212,21 @@ void stepper_init(void)
 
     ESP_LOGI(TAG, "Stepper driver initialized");
 
-    // Create hardware timer (1ms period = 1000 steps/sec max = 1.25 mm/sec)
+    // Initialize sine LUT for dithering
+    init_sin_lut();
+    ESP_LOGI(TAG, "Sine LUT initialized (LUT_SIZE=%d, sin_inc_q=0x%08lx)", LUT_SIZE, sin_inc_q);
+
+    // Create hardware timer at fixed 20kHz
     gptimer_config_t timer_config = {
         .clk_src = GPTIMER_CLK_SRC_DEFAULT,
         .direction = GPTIMER_COUNT_UP,
-        .resolution_hz = 1000000, // 1 MHz, 1 tick = 1us
+        .resolution_hz = TICK_HZ, // 20 kHz timer
     };
     ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &step_timer));
 
-    // Set alarm to trigger every 1ms (1000 us)
+    // Set alarm to trigger every tick (50us at 20kHz)
     gptimer_alarm_config_t alarm_config = {
-        .alarm_count = 1000, // 1ms at 1MHz
+        .alarm_count = 1, // Trigger every tick
         .reload_count = 0,
         .flags.auto_reload_on_alarm = true,
     };
@@ -219,29 +242,23 @@ void stepper_init(void)
     ESP_ERROR_CHECK(gptimer_enable(step_timer));
     ESP_ERROR_CHECK(gptimer_start(step_timer));
 
-    ESP_LOGI(TAG, "Hardware timer started (1ms period, 1000 steps/sec)");
+    ESP_LOGI(TAG, "Hardware timer started at %d Hz with phase accumulator", TICK_HZ);
 }
 
 // Start non-blocking movement with speed control
-void start_move(int32_t steps, bool direction, uint32_t speed_us)
+void start_move(int32_t steps, bool direction, float speed_mm_per_sec)
 {
+    int32_t start_pos = current_position_steps;
     target_position_steps = current_position_steps + (direction ? steps : -steps);
     motor_direction = direction;
-    current_speed_ms = speed_us;
 
-    // Stop timer to reconfigure
-    gptimer_stop(step_timer);
+    // Convert speed from mm/s to steps/sec
+    // steps/sec = mm/s * steps/mm
+    base_sps = (uint32_t)(speed_mm_per_sec * STEPS_PER_MM);
+    if (base_sps < 1) base_sps = 1;
 
-    // Update timer period for new speed (speed_us is already in microseconds)
-    gptimer_alarm_config_t alarm_config = {
-        .alarm_count = speed_us, // Period in microseconds
-        .reload_count = 0,
-        .flags.auto_reload_on_alarm = true,
-    };
-    gptimer_set_alarm_action(step_timer, &alarm_config);
-
-    // Restart timer with new speed
-    gptimer_start(step_timer);
+    // Reset phase accumulator for new move
+    phase_q = 0;
 
     motor_moving = true;
     gpio_set_level(DIR_PIN, direction ? 1 : 0);
@@ -258,56 +275,52 @@ void stop_move(void)
 void process_command(const char* cmd)
 {
     if (strncmp(cmd, "MOVE ", 5) == 0) {
-        // Parse distance and optional speed from "MOVE 10.5" or "MOVE 10.5 500"
-        float distance = atof(cmd + 5);
+        // Parse distance and optional speed from "MOVE 10.5" or "MOVE 10.5 2.5"
+        // Skip any leading spaces after MOVE
+        const char* params = cmd + 5;
+        while (*params == ' ') params++;
+
+        float distance = atof(params);
         bool direction = distance >= 0;
         if (distance < 0) distance = -distance;
 
-        // Check for optional speed parameter (in microseconds per step)
-        uint32_t speed_us = 1000; // Default 1000us (1ms) = 1000 steps/sec
-        const char* space_pos = strchr(cmd + 5, ' ');
+        // Check for optional speed parameter (in mm/s)
+        float speed_mm_per_sec = 1.25; // Default 1.25 mm/s
+        const char* space_pos = strchr(params, ' ');
         if (space_pos != NULL) {
-            int speed_int = atoi(space_pos + 1);
-            if (speed_int > 0) {
-                speed_us = (uint32_t)speed_int;
+            float speed_float = atof(space_pos + 1);
+            if (speed_float > 0.0) {
+                speed_mm_per_sec = speed_float;
             }
         }
 
         int32_t steps = (int32_t)(distance * STEPS_PER_MM);
-        ESP_LOGI(TAG, "Command: Move %.2f mm (%ld steps) at %lu us/step",
-                 direction ? distance : -distance, steps, speed_us);
-        start_move(steps, direction, speed_us);
+        start_move(steps, direction, speed_mm_per_sec);
         printf("OK\n");
     }
     else if (strcmp(cmd, "STOP") == 0) {
         stop_move();
-        ESP_LOGI(TAG, "Motor stopped");
         printf("OK\n");
     }
     else if (strcmp(cmd, "ZERO") == 0) {
         current_position_steps = 0;
-        ESP_LOGI(TAG, "Position zeroed");
         printf("OK\n");
     }
     else if (strcmp(cmd, "ENABLE") == 0) {
         gpio_set_level(EN_PIN, 0);  // Enable motor
-        ESP_LOGI(TAG, "Motor enabled");
         printf("OK\n");
     }
     else if (strcmp(cmd, "DISABLE") == 0) {
         stop_move();
         gpio_set_level(EN_PIN, 1);  // Disable motor
-        ESP_LOGI(TAG, "Motor disabled");
         printf("OK\n");
     }
     else if (strcmp(cmd, "MEASURE_START") == 0) {
         measuring_active = true;
-        ESP_LOGI(TAG, "Measurement started");
         printf("OK\n");
     }
     else if (strcmp(cmd, "MEASURE_STOP") == 0) {
         measuring_active = false;
-        ESP_LOGI(TAG, "Measurement stopped");
         printf("OK\n");
     }
     else {
@@ -403,18 +416,23 @@ void app_main(void)
         // Check if motor just finished moving
         static bool was_moving = false;
         if (was_moving && !motor_moving) {
-            printf("MOVE_COMPLETE\n");
+            float actual_distance_mm = (float)current_position_steps / STEPS_PER_MM;
+            printf("MOVE_COMPLETE pos=%.3f mm\n", actual_distance_mm);
             fflush(stdout);
         }
         was_moving = motor_moving;
 
         // Read and output load cell data with position (only when measuring)
         if (measuring_active) {
-            int32_t value = hx711_read_raw();
-            float position_mm = (float)current_position_steps / STEPS_PER_MM;
-            printf("%.3f,%ld\n", position_mm, value);
-            fflush(stdout);  // Force immediate transmission
+            if (hx711_is_ready()) {
+                int32_t pos_steps = current_position_steps;
+                int32_t value = hx711_read_raw_no_wait();
+                float position_mm = (float)pos_steps / STEPS_PER_MM;
+                printf("%.3f,%ld\n", position_mm, value);
+                fflush(stdout);  // Force immediate transmission
+            }
         }
-        vTaskDelay(pdMS_TO_TICKS(10));  // 10ms delay = 100Hz sample rate
+
+        vTaskDelay(pdMS_TO_TICKS(5));  // 5ms delay - prevents watchdog timeout
     }
 }

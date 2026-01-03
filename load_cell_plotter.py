@@ -42,7 +42,7 @@ class SerialReaderThread(QThread):
 
                         if line and line != "READY" and not line.startswith("I ("):
                             # Handle MOVE_COMPLETE message
-                            if line == 'MOVE_COMPLETE':
+                            if line.startswith('MOVE_COMPLETE'):
                                 # Emit special marker for move complete
                                 self.data_received.emit(-999.0, 0)
                                 continue
@@ -479,7 +479,7 @@ class LoadCellPlotter(QMainWindow):
         """Send move command with distance from input"""
         try:
             distance = float(self.distance_input.text())
-            self.send_command(f"MOVE {distance}")
+            self.send_command(f"MOVE {distance} 4.0")
         except ValueError:
             self.status_label.setText("Status: Invalid distance value")
 
@@ -598,8 +598,8 @@ class LoadCellPlotter(QMainWindow):
             self.send_command("MEASURE_START")
             import time
             time.sleep(0.1)  # Small delay between commands
-            print(f"Sending MOVE {distance} 2000")
-            self.send_command(f"MOVE {distance} 2000")
+            print(f"Sending MOVE {distance} 0.5")  # 0.5 mm/s for accurate measurement
+            self.send_command(f"MOVE {distance} 0.5")
 
         except ValueError as e:
             print(f"ValueError: {e}")  # Debug
@@ -619,11 +619,11 @@ class LoadCellPlotter(QMainWindow):
     def on_move_complete(self):
         """Called when ESP32 reports movement is complete"""
         if self.measuring:
-            # Stop measuring and move back at 2x speed (500us = 0.5ms per step)
+            # Stop measuring and move back at 2x speed (2.5 mm/s)
             self.send_command("MEASURE_STOP")
             import time
             time.sleep(0.1)
-            self.send_command(f"MOVE {-self.measurement_distance} 250")
+            self.send_command(f"MOVE {-self.measurement_distance} 4")  # 4 mm/s for faster return
 
             # Update UI
             self.measuring = False
