@@ -2,8 +2,9 @@ import sys
 import os
 import json
 
-from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox, QLineEdit, QDialog, QFormLayout, QListWidget
-from PyQt6.QtCore import QTimer, QThread, pyqtSignal
+from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox, QLineEdit, QDialog, QFormLayout, QListWidget, QFileDialog, QInputDialog, QMessageBox
+from PyQt6.QtCore import QTimer, QThread, pyqtSignal, Qt
+from PyQt6 import QtCore
 import serial
 import serial.tools.list_ports
 from collections import deque
@@ -208,6 +209,7 @@ class LoadCellPlotter(QMainWindow):
         self.data_buffer = deque(maxlen=1000)  # Store last 1000 force values (converted to grams if calibrated)
         self.raw_data_buffer = deque(maxlen=1000)  # Store raw values before calibration conversion
         self.position_data = deque(maxlen=1000)  # Store position values
+        self.position_offset = 0.0  # Offset to make first measurement value zero
         self.sample_count = 0
 
         # Measurement state
@@ -216,6 +218,16 @@ class LoadCellPlotter(QMainWindow):
         self.measurement_count = 0
         self.measurement_colors = ['b', 'r', 'g', 'm', 'c', 'y', 'w']
         self.current_color_index = 0
+
+        # Gun management
+        self.guns = []  # List of gun names
+        self.current_gun = None  # Currently selected gun
+        self.gun_measurements = {}  # Dict: gun_name -> measurement_count
+        self.gun_styles = {}  # Dict: gun_name -> plot style
+        self.available_styles = [QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenStyle.DashLine,
+                                  QtCore.Qt.PenStyle.DotLine, QtCore.Qt.PenStyle.DashDotLine,
+                                  QtCore.Qt.PenStyle.DashDotDotLine]
+        self.all_measurements = []  # List of dicts with gun, measurement data
 
         # Calibration state
         self.calibration_points = []  # List of (raw, grams) tuples
@@ -238,12 +250,55 @@ class LoadCellPlotter(QMainWindow):
         import pyqtgraph as pg
 
         self.setWindowTitle("Load Cell Monitor")
-        self.setGeometry(100, 100, 1200, 600)
+        self.setGeometry(100, 100, 1400, 600)
+
+        # Menu bar
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu('File')
+
+        save_action = file_menu.addAction('Save Data...')
+        save_action.triggered.connect(self.save_data)
+
+        load_action = file_menu.addAction('Load Data...')
+        load_action.triggered.connect(self.load_data)
 
         # Central widget
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        layout = QVBoxLayout(central_widget)
+        main_layout = QHBoxLayout(central_widget)
+
+        # Left panel - Gun management
+        left_panel = QWidget()
+        left_panel.setMaximumWidth(250)
+        left_layout = QVBoxLayout(left_panel)
+
+        gun_label = QLabel("Guns:")
+        gun_label.setStyleSheet("font-weight: bold; font-size: 12pt;")
+        left_layout.addWidget(gun_label)
+
+        self.gun_list = QListWidget()
+        self.gun_list.itemClicked.connect(self.select_gun)
+        left_layout.addWidget(self.gun_list)
+
+        self.add_gun_btn = QPushButton("Add Gun")
+        self.add_gun_btn.clicked.connect(self.add_gun)
+        left_layout.addWidget(self.add_gun_btn)
+
+        self.remove_gun_btn = QPushButton("Remove Gun")
+        self.remove_gun_btn.clicked.connect(self.remove_gun)
+        left_layout.addWidget(self.remove_gun_btn)
+
+        self.current_gun_label = QLabel("Selected: None")
+        self.current_gun_label.setStyleSheet("font-style: italic;")
+        left_layout.addWidget(self.current_gun_label)
+
+        left_layout.addStretch()
+        main_layout.addWidget(left_panel)
+
+        # Right panel - existing controls and plot
+        right_panel = QWidget()
+        layout = QVBoxLayout(right_panel)
+        main_layout.addWidget(right_panel)
 
         # Control panel - Connection row
         connection_layout = QHBoxLayout()
@@ -493,13 +548,20 @@ class LoadCellPlotter(QMainWindow):
         # Always store raw value before conversion
         self.raw_data_buffer.append(force)
 
+        # Set offset from first position value in measurement
+        if len(self.position_data) == 0:
+            self.position_offset = position
+
+        # Apply offset so measurement starts at zero, then abs() for positive display
+        position_zeroed = abs(position - self.position_offset)
+
         # Convert force to grams if calibration is active
         if self.calibration_active:
             force_value = self.raw_to_grams(force)
         else:
             force_value = force
 
-        self.position_data.append(position)
+        self.position_data.append(position_zeroed)
         self.data_buffer.append(force_value)
         self.sample_count += 1
 
@@ -564,6 +626,13 @@ class LoadCellPlotter(QMainWindow):
     def start_measurement(self):
         """Start a measurement sequence"""
         print("start_measurement called")  # Debug
+
+        # Check if a gun is selected
+        if self.current_gun is None:
+            self.status_label.setText("Status: Please select a gun first")
+            QMessageBox.warning(self, "No Gun Selected", "Please select a gun before measuring.")
+            return
+
         try:
             distance = float(self.measure_distance_input.text())
             print(f"Distance: {distance}")  # Debug
@@ -573,19 +642,29 @@ class LoadCellPlotter(QMainWindow):
 
             self.measurement_distance = distance
             self.measuring = True
+
+            # Increment measurement count for this gun
+            if self.current_gun not in self.gun_measurements:
+                self.gun_measurements[self.current_gun] = 0
+            self.gun_measurements[self.current_gun] += 1
+            gun_measurement_num = self.gun_measurements[self.current_gun]
+
+            # Increment global measurement count for coloring
             self.measurement_count += 1
-            print(f"Starting measurement {self.measurement_count}")  # Debug
+            print(f"Starting measurement {self.measurement_count} for {self.current_gun}")   # Debug
 
             # Update UI
             self.measure_btn.setEnabled(False)
             self.stop_measure_btn.setEnabled(True)
             self.move_btn.setEnabled(False)
-            self.status_label.setText(f"Status: Measuring ({self.measurement_count})...")
+            self.status_label.setText(f"Status: Measuring {self.current_gun} #{gun_measurement_num}...")
 
-            # Create new plot line with next color
+            # Create new plot line with next color and gun-specific style
             self.current_color_index = (self.measurement_count - 1) % len(self.measurement_colors)
-            pen = pg.mkPen(color=self.measurement_colors[self.current_color_index], width=2)
-            new_line = self.plot_widget.plot([], [], pen=pen, name=f"Measurement {self.measurement_count}")
+            gun_style = self.gun_styles.get(self.current_gun, QtCore.Qt.PenStyle.SolidLine)
+            pen = pg.mkPen(color=self.measurement_colors[self.current_color_index], width=2, style=gun_style)
+            measurement_label = f"{self.current_gun} measurement {gun_measurement_num}"
+            new_line = self.plot_widget.plot([], [], pen=pen, name=measurement_label)
             self.plot_lines.append(new_line)
             self.plot_line = new_line  # Update current plot line
 
@@ -619,7 +698,16 @@ class LoadCellPlotter(QMainWindow):
     def on_move_complete(self):
         """Called when ESP32 reports movement is complete"""
         if self.measuring:
-            # Stop measuring and move back at 2x speed (2.5 mm/s)
+            # Store the completed measurement data
+            gun_measurement_num = self.gun_measurements.get(self.current_gun, 0)
+            self.all_measurements.append({
+                'gun': self.current_gun,
+                'measurement_num': gun_measurement_num,
+                'positions': list(self.position_data),
+                'forces': list(self.data_buffer)
+            })
+
+            # Stop measuring and move back at 2x speed (4 mm/s)
             self.send_command("MEASURE_STOP")
             import time
             time.sleep(0.1)
@@ -630,7 +718,7 @@ class LoadCellPlotter(QMainWindow):
             self.measure_btn.setEnabled(True)
             self.stop_measure_btn.setEnabled(False)
             self.move_btn.setEnabled(True)
-            self.status_label.setText(f"Status: Measurement {self.measurement_count} complete, returning...")
+            self.status_label.setText(f"Status: Measurement complete, returning...")
 
     def open_calibration_dialog(self):
         """Open the calibration dialog"""
@@ -720,6 +808,185 @@ class LoadCellPlotter(QMainWindow):
                 print(f"Calibration loaded: {len(self.calibration_points)} points, active={self.calibration_active}")
         except Exception as e:
             print(f"Error loading calibration: {e}")
+
+    def add_gun(self):
+        """Add a new gun to the list"""
+        gun_name, ok = QInputDialog.getText(self, "Add Gun", "Enter gun name:")
+        if ok and gun_name:
+            if gun_name in self.guns:
+                QMessageBox.warning(self, "Duplicate Gun", f"Gun '{gun_name}' already exists.")
+                return
+            self.guns.append(gun_name)
+            self.gun_list.addItem(gun_name)
+            self.gun_measurements[gun_name] = 0
+            # Assign a style to this gun (cycle through available styles)
+            style_idx = len(self.guns) - 1
+            self.gun_styles[gun_name] = self.available_styles[style_idx % len(self.available_styles)]
+            # Auto-select the newly added gun
+            self.gun_list.setCurrentRow(len(self.guns) - 1)
+            self.select_gun(self.gun_list.currentItem())
+
+    def remove_gun(self):
+        """Remove selected gun from list"""
+        current_item = self.gun_list.currentItem()
+        if current_item is None:
+            QMessageBox.warning(self, "No Selection", "Please select a gun to remove.")
+            return
+
+        gun_name = current_item.text()
+        reply = QMessageBox.question(self, "Remove Gun",
+                                      f"Remove '{gun_name}' and all its measurements?",
+                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+
+        if reply == QMessageBox.StandardButton.Yes:
+            self.guns.remove(gun_name)
+            self.gun_list.takeItem(self.gun_list.row(current_item))
+            if gun_name in self.gun_measurements:
+                del self.gun_measurements[gun_name]
+            if gun_name in self.gun_styles:
+                del self.gun_styles[gun_name]
+
+            # Remove measurements from data
+            self.all_measurements = [m for m in self.all_measurements if m['gun'] != gun_name]
+
+            # Clear and redraw the graph with remaining measurements
+            self.redraw_all_measurements()
+
+            if self.current_gun == gun_name:
+                self.current_gun = None
+                self.current_gun_label.setText("Selected: None")
+
+    def select_gun(self, item):
+        """Select a gun from the list"""
+        if item:
+            self.current_gun = item.text()
+            self.current_gun_label.setText(f"Selected: {self.current_gun}")
+            print(f"Selected gun: {self.current_gun}")
+
+    def redraw_all_measurements(self):
+        """Clear and redraw all measurements on the graph"""
+        # Remove all plot lines from plot widget
+        for plot_line in self.plot_lines:
+            self.plot_widget.removeItem(plot_line)
+        self.plot_lines.clear()
+
+        # Clear and recreate legend
+        self.plot_widget.removeItem(self.legend)
+        self.legend = self.plot_widget.addLegend(offset=(-10, 10), anchor=(1, 0))
+
+        # Recreate initial plot line
+        pen = pg.mkPen(color=self.measurement_colors[0], width=2)
+        self.plot_line = self.plot_widget.plot([], [], pen=pen, name='Current')
+        self.plot_lines.append(self.plot_line)
+
+        # Redraw all stored measurements
+        color_idx = 0
+        for measurement in self.all_measurements:
+            gun = measurement['gun']
+            meas_num = measurement['measurement_num']
+            positions = measurement['positions']
+            forces = measurement['forces']
+
+            gun_style = self.gun_styles.get(gun, QtCore.Qt.PenStyle.SolidLine)
+            pen = pg.mkPen(color=self.measurement_colors[color_idx % len(self.measurement_colors)], width=2, style=gun_style)
+            measurement_label = f"{gun} measurement {meas_num}"
+            new_line = self.plot_widget.plot(positions, forces, pen=pen, name=measurement_label)
+            self.plot_lines.append(new_line)
+            color_idx += 1
+
+    def save_data(self):
+        """Save all measurement data to CSV file"""
+        if not self.all_measurements:
+            QMessageBox.warning(self, "No Data", "No measurements to save.")
+            return
+
+        filename, _ = QFileDialog.getSaveFileName(self, "Save Data", "", "CSV Files (*.csv)")
+        if filename:
+            try:
+                import csv
+                with open(filename, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    # Write header
+                    writer.writerow(['Gun', 'Measurement', 'Position_mm', 'Force'])
+
+                    # Write all measurement data
+                    for measurement in self.all_measurements:
+                        gun = measurement['gun']
+                        meas_num = measurement['measurement_num']
+                        positions = measurement['positions']
+                        forces = measurement['forces']
+
+                        for pos, force in zip(positions, forces):
+                            writer.writerow([gun, meas_num, f"{pos:.3f}", force])
+
+                QMessageBox.information(self, "Success", f"Data saved to {filename}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to save data: {e}")
+
+    def load_data(self):
+        """Load measurement data from CSV file"""
+        filename, _ = QFileDialog.getOpenFileName(self, "Load Data", "", "CSV Files (*.csv)")
+        if filename:
+            try:
+                import csv
+                # Clear existing data
+                self.clear_data()
+                self.all_measurements.clear()
+
+                # Read CSV
+                measurements_dict = {}  # (gun, meas_num) -> (positions, forces)
+
+                with open(filename, 'r') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        gun = row['Gun']
+                        meas_num = int(row['Measurement'])
+                        position = float(row['Position_mm'])
+                        force = float(row['Force'])
+
+                        # Add gun if not exists
+                        if gun not in self.guns:
+                            self.guns.append(gun)
+                            self.gun_list.addItem(gun)
+                            self.gun_measurements[gun] = 0
+                            # Assign style to newly loaded gun
+                            style_idx = len(self.guns) - 1
+                            self.gun_styles[gun] = self.available_styles[style_idx % len(self.available_styles)]
+
+                        # Track max measurement number for this gun
+                        if meas_num > self.gun_measurements.get(gun, 0):
+                            self.gun_measurements[gun] = meas_num
+
+                        # Group data by (gun, measurement)
+                        key = (gun, meas_num)
+                        if key not in measurements_dict:
+                            measurements_dict[key] = ([], [])
+                        measurements_dict[key][0].append(position)
+                        measurements_dict[key][1].append(force)
+
+                # Plot all measurements
+                color_idx = 0
+                for (gun, meas_num), (positions, forces) in sorted(measurements_dict.items()):
+                    gun_style = self.gun_styles.get(gun, QtCore.Qt.PenStyle.SolidLine)
+                    pen = pg.mkPen(color=self.measurement_colors[color_idx % len(self.measurement_colors)], width=2, style=gun_style)
+                    measurement_label = f"{gun} measurement {meas_num}"
+                    new_line = self.plot_widget.plot(positions, forces, pen=pen, name=measurement_label)
+                    self.plot_lines.append(new_line)
+
+                    # Store measurement data
+                    self.all_measurements.append({
+                        'gun': gun,
+                        'measurement_num': meas_num,
+                        'positions': positions,
+                        'forces': forces
+                    })
+
+                    color_idx += 1
+                    self.measurement_count += 1
+
+                QMessageBox.information(self, "Success", f"Loaded {len(measurements_dict)} measurements from {filename}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to load data: {e}")
 
     def closeEvent(self, event):
         self.save_calibration()
