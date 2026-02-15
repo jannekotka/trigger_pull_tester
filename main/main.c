@@ -8,6 +8,7 @@
 #include "driver/gptimer.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
+#include "esp_task_wdt.h"
 
 // TB6600 Stepper Driver pins
 #define STEP_PIN GPIO_NUM_25
@@ -23,7 +24,7 @@
 // Step pulse timing (microseconds)
 #define STEP_PULSE_WIDTH_US 5   // Pulse width (10us for reliability)
 #define STEP_DELAY_MIN_US   400 // Slower speed for 1/8 microstepping (500 Hz)
-#define ACCEL_STEPS         500   // Number of steps to accelerate/decelerate
+#define ACCEL_STEPS         640   // Number of steps to accelerate/decelerate
 
 // Motor and lead screw configuration
 #define STEPS_PER_REV       200   // 1.8° motor = 200 steps/rev
@@ -40,12 +41,14 @@
 // Motor state for non-blocking movement
 static volatile int32_t target_position_steps = 0;
 static volatile int32_t current_position_steps = 0;
+static volatile int32_t start_position_steps = 0;
+static volatile int32_t total_steps = 0;
 static volatile bool motor_moving = false;
 static volatile bool motor_direction = 0; // 0 = backward, 1 = forward
 static volatile bool measuring_active = false; // Only output load cell data when measuring
 
 // Base speed in steps/sec (set from control task)
-static volatile uint32_t base_sps = 1000;          // steps per second
+static volatile uint32_t base_sps = 1000;          // steps per second (max speed)
 static volatile uint16_t dither_eps_permille = 100; // 100 = 10% speed dither
 
 // Internal ISR state for phase accumulator
@@ -59,7 +62,6 @@ static int16_t sin_lut[LUT_SIZE];
 static gptimer_handle_t step_timer = NULL;
 
 // Forward declarations
-void move_distance_mm(float distance_mm, bool direction);
 void stepper_init(void);
 
 // Initialize sine LUT (call once at init)
@@ -91,10 +93,35 @@ static bool IRAM_ATTR step_timer_callback(gptimer_handle_t timer, const gptimer_
         return false;
     }
 
-    // Compute dithered step rate per tick in Q16.16:
-    // step_rate_per_tick = (steps/sec) / TICK_HZ
-    // dither: base * (1 + eps * sin)
-    uint32_t sps = base_sps;
+    // Calculate current step in move (absolute value)
+    int32_t steps_taken;
+    if (motor_direction) {
+        steps_taken = current_position_steps - start_position_steps;
+    } else {
+        steps_taken = start_position_steps - current_position_steps;
+    }
+
+    // Calculate steps remaining
+    int32_t steps_remaining = total_steps - steps_taken;
+
+    // Acceleration profile: ramp up and down over ACCEL_STEPS
+    uint32_t accel_steps = (total_steps < ACCEL_STEPS * 2) ? total_steps / 2 : ACCEL_STEPS;
+    uint32_t sps;
+
+    if (steps_taken < accel_steps) {
+        // Acceleration phase: linear ramp from 20% to 100% of base_sps
+        sps = (base_sps * 20) / 100 + ((base_sps * 80 * steps_taken) / (100 * accel_steps));
+    } else if (steps_remaining < accel_steps) {
+        // Deceleration phase: linear ramp from 100% to 20% of base_sps
+        sps = (base_sps * 20) / 100 + ((base_sps * 80 * steps_remaining) / (100 * accel_steps));
+    } else {
+        // Constant speed phase
+        sps = base_sps;
+    }
+
+    if (sps < 1) sps = 1;
+
+    // Apply dither on top of acceleration profile
 
     sin_phase_q += sin_inc_q;
     uint16_t idx = (sin_phase_q >> 16) & (LUT_SIZE - 1);
@@ -245,14 +272,15 @@ void stepper_init(void)
     ESP_LOGI(TAG, "Hardware timer started at %d Hz with phase accumulator", TICK_HZ);
 }
 
-// Start non-blocking movement with speed control
+// Start non-blocking movement with speed control and acceleration
 void start_move(int32_t steps, bool direction, float speed_mm_per_sec)
 {
-    int32_t start_pos = current_position_steps;
+    start_position_steps = current_position_steps;
+    total_steps = steps;
     target_position_steps = current_position_steps + (direction ? steps : -steps);
     motor_direction = direction;
 
-    // Convert speed from mm/s to steps/sec
+    // Convert speed from mm/s to steps/sec (this is max speed)
     // steps/sec = mm/s * steps/mm
     base_sps = (uint32_t)(speed_mm_per_sec * STEPS_PER_MM);
     if (base_sps < 1) base_sps = 1;
@@ -328,56 +356,11 @@ void process_command(const char* cmd)
     }
 }
 
-void stepper_step_accel(uint32_t steps, bool direction)
-{
-    // Set direction
-    gpio_set_level(DIR_PIN, direction ? 1 : 0);
-    ESP_LOGI(TAG, "Moving %ld steps in %s direction", steps, direction ? "CW" : "CCW");
-
-    // Small delay after changing direction
-    vTaskDelay(2 / portTICK_PERIOD_MS);
-
-    uint32_t accel_steps = (steps < ACCEL_STEPS * 2) ? steps / 2 : ACCEL_STEPS;
-
-    // Generate step pulses with acceleration
-    for(uint32_t i = 0; i < steps; i++) {
-        uint32_t delay_us;
-
-        // Acceleration phase
-        if(i < accel_steps) {
-            delay_us = STEP_DELAY_MIN_US + ((accel_steps - i) * STEP_DELAY_MIN_US / accel_steps);
-        }
-        // Deceleration phase
-        else if(i >= steps - accel_steps) {
-            delay_us = STEP_DELAY_MIN_US + ((i - (steps - accel_steps)) * STEP_DELAY_MIN_US / accel_steps);
-        }
-        // Constant speed phase
-        else {
-            delay_us = STEP_DELAY_MIN_US;
-        }
-
-        gpio_set_level(STEP_PIN, 1);
-        esp_rom_delay_us(STEP_PULSE_WIDTH_US);
-        gpio_set_level(STEP_PIN, 0);
-        esp_rom_delay_us(delay_us);
-    }
-
-    ESP_LOGI(TAG, "Movement complete");
-}
-
-void move_distance_mm(float distance_mm, bool direction)
-{
-    // Calculate steps needed
-    uint32_t steps = (uint32_t)(distance_mm * STEPS_PER_MM);
-
-    ESP_LOGI(TAG, "Moving %.2f mm (%ld steps) in %s direction",
-             distance_mm, steps, direction ? "forward" : "backward");
-
-    stepper_step_accel(steps, direction);
-}
-
 void app_main(void)
 {
+    // Add this task to the watchdog
+    esp_task_wdt_add(NULL);
+
     // Initialize hardware
     hx711_init();
     stepper_init();
@@ -433,6 +416,8 @@ void app_main(void)
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(5));  // 5ms delay - prevents watchdog timeout
+        // Reset watchdog and minimal delay to allow idle task to run
+        esp_task_wdt_reset();
+        vTaskDelay(1);  // 1 tick (~1ms) - minimal delay for idle task
     }
 }
